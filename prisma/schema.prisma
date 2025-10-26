@@ -1,0 +1,241 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// This is your Prisma schema file.
+// Merged with additional models: PriceRule, AddOn, AuditLog and extended fields for Location, Vehicle, Booking
+
+model User {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  email        String    @unique
+  passwordHash String
+  phone        String?
+  role         UserRole  @default(customer)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Relations
+  bookings Booking[]
+  reviews  Review[]
+
+  @@map("users")
+}
+
+model Vehicle {
+  id           String        @id @default(auto()) @map("_id") @db.ObjectId
+  sku          String?       @unique
+  make         String
+  model        String
+  year         Int
+  category     String
+  transmission Transmission
+  fuelType     FuelType
+  baseDailyRate Float
+  dailyRate    Float
+  status       VehicleStatus @default(available)
+  locationId   String?       @db.ObjectId
+  imageUrl     String?
+  description  String?
+  seats        Int           @default(5)
+  doors        Int           @default(4)
+  features     String[]      @default([])
+  metadata     Json?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  // Relations
+  location Location? @relation(fields: [locationId], references: [id])
+  bookings Booking[]
+  reviews  Review[]
+
+  @@map("vehicles")
+}
+
+model Location {
+  id      String       @id @default(auto()) @map("_id") @db.ObjectId
+  name    String
+  code    String       @unique
+  address String
+  type    LocationType
+  city    String
+  state   String?
+  country String       @default("USA")
+  zipCode String?
+  phone   String?
+  hours   String?
+  isActive Boolean     @default(true)
+  // Extended location-specific rules
+  minAge         Int?
+  debitAllowed   Boolean @default(false)
+  depositAmount  Float?
+  currency       String  @default("USD")
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  // Relations
+  vehicles           Vehicle[]
+  pickupBookings     Booking[] @relation("PickupLocation")
+  dropoffBookings    Booking[] @relation("DropoffLocation")
+
+  @@map("locations")
+}
+
+model Booking {
+  id                String        @id @default(auto()) @map("_id") @db.ObjectId
+  userId            String        @db.ObjectId
+  vehicleId         String?       @db.ObjectId
+  locationPickupId  String        @db.ObjectId
+  locationDropoffId String        @db.ObjectId
+  startDate         DateTime
+  endDate           DateTime
+  subtotal          Float
+  taxes             Float
+  fees              Float
+  totalPrice        Float
+  addons            Json?
+  insuranceSelected Json?
+  promoCode         String?
+  status            BookingStatus @default(pending)
+  paymentStatus     String        @default("pending")
+  holdExpiresAt     DateTime?
+  notes             String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  // Relations
+  user             User     @relation(fields: [userId], references: [id])
+  vehicle          Vehicle? @relation(fields: [vehicleId], references: [id])
+  pickupLocation   Location @relation("PickupLocation", fields: [locationPickupId], references: [id])
+  dropoffLocation  Location @relation("DropoffLocation", fields: [locationDropoffId], references: [id])
+  payment          Payment?
+  
+  @@map("bookings")
+}
+
+model Payment {
+  id        String        @id @default(auto()) @map("_id") @db.ObjectId
+  bookingId String        @unique @db.ObjectId
+  amount    Float
+  method    PaymentMethod
+  status    PaymentStatus @default(pending)
+  providerId String?
+  createdAt DateTime      @default(now())
+
+  // Relations
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@map("payments")
+}
+
+model Review {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  vehicleId String   @db.ObjectId
+  rating    Int      // 1-5 stars
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  user    User    @relation(fields: [userId], references: [id])
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id])
+
+  @@map("reviews")
+}
+
+model PriceRule {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  type        String   // "seasonal" | "weekday" | "length_of_rental" | "promo"
+  vehicleCategory String?
+  startDate   DateTime?
+  endDate     DateTime?
+  multiplier  Float?
+  flatAmount  Float?
+  code        String?  @unique
+  createdAt   DateTime @default(now())
+}
+
+model AddOn {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  code      String   @unique
+  name      String
+  price     Float
+  perDay    Boolean  @default(true)
+  stock     Int?
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  entity    String
+  entityId  String
+  action    String
+  data      Json?
+  createdAt DateTime @default(now())
+}
+
+// Enums
+enum UserRole {
+  customer
+  admin
+}
+
+enum Transmission {
+  manual
+  automatic
+}
+
+enum FuelType {
+  gasoline
+  diesel
+  hybrid
+  electric
+}
+
+enum VehicleStatus {
+  available
+  rented
+  maintenance
+  retired
+}
+
+enum LocationType {
+  airport
+  city
+}
+
+enum BookingStatus {
+  pending
+  pending_hold
+  confirmed
+  active
+  completed
+  cancelled
+  no_show
+}
+
+enum PaymentMethod {
+  credit_card
+  debit_card
+  cash
+  bank_transfer
+}
+
+enum PaymentStatus {
+  pending
+  authorized
+  captured
+  completed
+  failed
+  refunded
+}
