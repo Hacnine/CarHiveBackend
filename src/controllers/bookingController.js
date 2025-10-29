@@ -6,10 +6,6 @@ const pricingService = require('../services/pricingService');
 const availabilityService = require('../services/availabilityService');
 const { logEvent } = require('../services/auditService');
 
-/**
- * Create a new booking
- * POST /api/bookings
- */
 const createBooking = async (req, res) => {
   try {
     // Validate request body
@@ -661,14 +657,155 @@ const confirmBooking = async (req, res) => {
   }
 };
 
+/**
+ * Get dashboard summary for the authenticated user
+ * GET /api/bookings/dashboard
+ */
+const getUserDashboard = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date();
+
+    const [upcomingOrdersCount, totalOrdersCount, cancelledOrdersCount, couponsCount, recentBookings] = await Promise.all([
+      // Upcoming: bookings with a future start date and not cancelled/completed
+      prisma.booking.count({
+        where: {
+          userId,
+          startDate: { gt: now },
+          status: { in: ['pending', 'pending_hold', 'confirmed'] }
+        }
+      }),
+      // Total bookings for the user
+      prisma.booking.count({ where: { userId } }),
+      // Cancelled bookings
+      prisma.booking.count({ where: { userId, status: 'cancelled' } }),
+      // Number of promo rules (available coupons)
+      prisma.priceRule.count({ where: { type: 'promo' } }),
+      // Recent bookings list (latest 5)
+      prisma.booking.findMany({
+        where: { userId },
+        include: {
+          vehicle: {
+            select: { id: true, make: true, model: true, year: true, imageUrl: true }
+          },
+          pickupLocation: { select: { id: true, name: true, city: true } },
+          dropoffLocation: { select: { id: true, name: true, city: true } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 5
+      })
+    ]);
+
+    const recentOrders = recentBookings.map(b => ({
+      orderId: b.id,
+      carName: b.vehicle ? `${b.vehicle.make} ${b.vehicle.model}` : 'Unknown vehicle',
+      pickUpLocation: b.pickupLocation ? (b.pickupLocation.city || b.pickupLocation.name) : null,
+      dropOffLocation: b.dropoffLocation ? (b.dropoffLocation.city || b.dropoffLocation.name) : null,
+      pickUpDate: b.startDate,
+      returnDate: b.endDate,
+      status: b.status
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        upcomingOrders: upcomingOrdersCount,
+        coupons: couponsCount,
+        totalOrders: totalOrdersCount,
+        cancelledOrders: cancelledOrdersCount,
+        recentOrders
+      }
+    });
+  } catch (error) {
+    console.error('Get user dashboard error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+
+
+/**
+ * Pickup checklist — store inspection info and mark booking active
+ * POST /api/bookings/:id/pickup
+ */
+const pickupChecklist = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { photos = [], fuelLevel = null, odometer = null, notes = '' } = req.body;
+
+    const booking = await prisma.booking.findUnique({ where: { id } });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    // Only allow pickup when booking is confirmed
+    if (!['confirmed', 'pending'].includes(booking.status)) {
+      return res.status(400).json({ success: false, message: 'Booking cannot be picked up in its current state' });
+    }
+
+    // Save inspection data into the booking.addons JSON (legacy field) under pickupInspection
+    const addons = booking.addons || {};
+    addons.pickupInspection = { photos, fuelLevel, odometer, notes, at: new Date() };
+
+    const updated = await prisma.booking.update({ where: { id }, data: { addons, status: 'active' } });
+
+    await logEvent('booking', id, 'picked_up', { userId: req.user.id, photosCount: photos.length, fuelLevel, odometer });
+
+    res.json({ success: true, message: 'Pickup recorded, booking is now active', data: { booking: updated } });
+  } catch (error) {
+    console.error('Pickup checklist error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Return checklist — store return inspection and close booking
+ * POST /api/bookings/:id/return
+ */
+const returnChecklist = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { photos = [], fuelLevel = null, odometer = null, damage = false, damageNotes = '' } = req.body;
+
+    const booking = await prisma.booking.findUnique({ where: { id } });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (booking.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Booking is not active' });
+    }
+
+    const addons = booking.addons || {};
+    addons.returnInspection = { photos, fuelLevel, odometer, damage, damageNotes, at: new Date() };
+
+    // If damage or fuel shortfall detected you might create an adjustments workflow; for now just store inspection and mark completed
+    const updated = await prisma.booking.update({ where: { id }, data: { addons, status: 'completed' } });
+
+    await logEvent('booking', id, 'returned', { userId: req.user.id, damage, odometer });
+
+    res.json({ success: true, message: 'Return recorded, booking completed', data: { booking: updated } });
+  } catch (error) {
+    console.error('Return checklist error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
 // Final exports
 module.exports = {
   createBooking,
   getUserBookings,
+  getUserDashboard,
   getBookingById,
   updateBookingStatus,
   cancelBooking,
   getAllBookings,
   holdBooking,
   confirmBooking,
+  pickupChecklist,
+  returnChecklist,
 };

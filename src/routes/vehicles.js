@@ -1,6 +1,7 @@
 const express = require('express');
 const {
   getVehicles,
+  getAvailableVehicles,
   getVehicleById,
   createVehicle,
   updateVehicle,
@@ -12,6 +13,8 @@ const router = express.Router();
 
 // Public routes
 router.get('/', optionalAuth, getVehicles);
+// Search available vehicles for a date range and filters
+router.get('/available', optionalAuth, getAvailableVehicles);
 router.get('/:id', getVehicleById);
 
 // Admin routes

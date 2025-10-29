@@ -2,12 +2,14 @@ const express = require('express');
 const {
   createBooking,
   getUserBookings,
+  getUserDashboard,
   getBookingById,
   updateBookingStatus,
   cancelBooking,
   getAllBookings,
   holdBooking,
   confirmBooking
+  , pickupChecklist, returnChecklist
 } = require('../controllers/bookingController');
 const { authenticate, authorize } = require('../middlewares/auth');
 
@@ -19,7 +21,13 @@ router.post('/', authenticate, createBooking);
 router.post('/hold', authenticate, holdBooking);
 // Confirm a held booking (capture payment)
 router.post('/confirm', authenticate, confirmBooking);
+// Mark pickup checklist / start rental
+router.post('/:id/pickup', authenticate, pickupChecklist);
+// Mark return checklist / complete rental
+router.post('/:id/return', authenticate, returnChecklist);
 router.get('/', authenticate, getUserBookings);
+// User dashboard summary
+router.get('/dashboard', authenticate, getUserDashboard);
 router.put('/:id/cancel', authenticate, cancelBooking);
 
 // Admin routes (place before parameterized routes to avoid conflict)

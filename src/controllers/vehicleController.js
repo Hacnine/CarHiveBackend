@@ -2,6 +2,8 @@ const { PrismaClient } = require('@prisma/client');
 const { vehicleSchema } = require('../utils/validation');
 
 const prisma = new PrismaClient();
+const availabilityService = require('../services/availabilityService');
+const pricingService = require('../services/pricingService');
 
 /**
  * Get all vehicles with filtering and search
@@ -417,8 +419,48 @@ const deleteVehicle = async (req, res) => {
 
 module.exports = {
   getVehicles,
+  // new export
+  getAvailableVehicles,
   getVehicleById,
   createVehicle,
   updateVehicle,
   deleteVehicle
 };
+
+/**
+ * Get available vehicles for a date range and optional filters
+ * GET /api/vehicles/available
+ */
+async function getAvailableVehicles(req, res) {
+  try {
+    const { startDate, endDate, locationCode, category, transmission, maxPrice } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ success: false, message: 'startDate and endDate are required' });
+    }
+
+    // Find candidates using availability service (which checks bookings)
+    const candidates = await availabilityService.findAvailableVehicles({ startDate, endDate, locationCode, category });
+
+    // Apply simple filters client-side
+    let filtered = candidates;
+    if (transmission) filtered = filtered.filter(v => String(v.transmission) === String(transmission));
+    if (maxPrice) filtered = filtered.filter(v => (v.dailyRate || v.baseDailyRate || 0) <= parseFloat(maxPrice));
+
+    // For each vehicle compute a price estimate
+    const estimates = [];
+    for (const v of filtered) {
+      try {
+        const price = await pricingService.calculatePriceForBooking({ vehicleId: v.id, startDate, endDate, addons: [], promoCode: null, userId: req.user ? req.user.id : null });
+        estimates.push({ vehicle: v, price });
+      } catch (e) {
+        estimates.push({ vehicle: v, price: null });
+      }
+    }
+
+    res.json({ success: true, data: { results: estimates } });
+  } catch (error) {
+    console.error('Get available vehicles error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+}

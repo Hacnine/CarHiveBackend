@@ -37,9 +37,18 @@ app.use(limiter);
 // Security middleware
 app.use(helmet());
 
-// CORS configuration
+// CORS configuration - support comma-separated FRONTEND_URL for multiple dev origins
+const rawFrontend = process.env.FRONTEND_URL || 'http://localhost:3000';
+const allowedOrigins = rawFrontend.split(',').map(u => u.trim()).filter(Boolean);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like curl, server-to-server)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Not allowed
+    return callback(new Error('CORS policy: Origin not allowed'), false);
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
