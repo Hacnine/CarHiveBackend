@@ -5,6 +5,8 @@ const prisma = new PrismaClient();
 const pricingService = require('../services/pricingService');
 const availabilityService = require('../services/availabilityService');
 const { logEvent } = require('../services/auditService');
+const notificationService = require('../services/notificationService');
+const LoyaltyService = require('../services/loyaltyService');
 
 const createBooking = async (req, res) => {
   try {
@@ -89,7 +91,7 @@ const createBooking = async (req, res) => {
     // Calculate total price (use pricing service)
     let priceBreakdown = { total: vehicle.dailyRate };
     try {
-      priceBreakdown = await pricingService.calculatePriceForBooking({ vehicleId, startDate: start, endDate: end, addons: [], promoCode: null, userId: req.user.id });
+      priceBreakdown = await pricingService.calculatePriceForBooking({ vehicleId, startDate: start, endDate: end, addons: [], promoCode: null, userId: req.user.id, pickupLocationId, dropoffLocationId });
     } catch (e) {
       console.warn('Pricing calculation failed, falling back to simple price', e);
     }
@@ -140,9 +142,21 @@ const createBooking = async (req, res) => {
             address: true,
             city: true
           }
+        },
+        user: {
+          select: {
+            email: true
+          }
         }
       }
     });
+
+    // Send confirmation email
+    try {
+      await notificationService.sendBookingConfirmation(booking.user.email, booking);
+    } catch (e) {
+      console.warn('Failed to send booking confirmation email', e);
+    }
 
     res.status(201).json({
       success: true,
@@ -393,7 +407,8 @@ const cancelBooking = async (req, res) => {
     const booking = await prisma.booking.findUnique({
       where: { id },
       include: {
-        payment: true
+        payment: true,
+        user: true
       }
     });
 
@@ -413,31 +428,62 @@ const cancelBooking = async (req, res) => {
     }
 
     // Check if booking can be cancelled
-    if (['completed', 'cancelled'].includes(booking.status)) {
+    if (['completed', 'cancelled', 'active'].includes(booking.status)) {
       return res.status(400).json({
         success: false,
         message: 'Cannot cancel this booking'
       });
     }
 
-    // Check if booking has started
     const now = new Date();
-    if (booking.startDate <= now && booking.status === 'active') {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot cancel an active booking'
-      });
+    const startDate = new Date(booking.startDate);
+    const hoursBeforeStart = (startDate - now) / (1000 * 60 * 60);
+
+    // Cancellation policy: free if >48 hours before start, else 50% fee
+    let cancellationFee = 0;
+    let refundAmount = 0;
+    if (hoursBeforeStart <= 48) {
+      cancellationFee = booking.totalPrice * 0.5;
+      refundAmount = booking.totalPrice - cancellationFee;
+    } else {
+      refundAmount = booking.totalPrice;
     }
+
+    const addons = booking.addons || {};
+    addons.cancellation = {
+      cancelledAt: now,
+      hoursBeforeStart,
+      cancellationFee,
+      refundAmount,
+      policy: hoursBeforeStart > 48 ? 'free' : '50% fee'
+    };
 
     const updatedBooking = await prisma.booking.update({
       where: { id },
-      data: { status: 'cancelled' }
+      data: { status: 'cancelled', addons }
     });
+
+    // Update vehicle status back to available if reserved
+    if (booking.vehicleId && ['confirmed', 'ready_for_pickup'].includes(booking.status)) {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'available' }
+      });
+    }
+
+    await logEvent('booking', id, 'cancelled', { userId: req.user.id, cancellationFee, refundAmount });
+
+    // Send cancellation confirmation
+    try {
+      await notificationService.sendCancellationNotice(booking.user.email, updatedBooking, { cancellationFee, refundAmount });
+    } catch (e) {
+      console.warn('Failed to send cancellation notice', e);
+    }
 
     res.json({
       success: true,
       message: 'Booking cancelled successfully',
-      data: { booking: updatedBooking }
+      data: { booking: updatedBooking, cancellationFee, refundAmount }
     });
   } catch (error) {
     console.error('Cancel booking error:', error);
@@ -574,7 +620,7 @@ const holdBooking = async (req, res) => {
     }
 
     // Calculate price
-    const price = await pricingService.calculatePriceForBooking({ vehicleId, startDate, endDate, addons, promoCode, userId: req.user.id });
+    const price = await pricingService.calculatePriceForBooking({ vehicleId, startDate, endDate, addons, promoCode, userId: req.user.id, pickupLocationId, dropoffLocationId });
 
     // Create booking with pending_hold and holdExpiresAt (e.g., 15 minutes)
     const holdDurationMinutes = parseInt(process.env.HOLD_MINUTES || '15');
@@ -731,7 +777,7 @@ const getUserDashboard = async (req, res) => {
 const pickupChecklist = async (req, res) => {
   try {
     const { id } = req.params;
-    const { photos = [], fuelLevel = null, odometer = null, notes = '' } = req.body;
+    const { photos = [], fuelLevel = null, odometer = null, notes = '', userVerified = false, documentsChecked = false, signature = null, damageAcknowledged = false } = req.body;
 
     const booking = await prisma.booking.findUnique({ where: { id } });
     if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
@@ -740,18 +786,26 @@ const pickupChecklist = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    // Only allow pickup when booking is confirmed
-    if (!['confirmed', 'pending'].includes(booking.status)) {
-      return res.status(400).json({ success: false, message: 'Booking cannot be picked up in its current state' });
+    // Only allow pickup when booking is ready for pickup
+    if (booking.status !== 'ready_for_pickup') {
+      return res.status(400).json({ success: false, message: 'Booking is not ready for pickup' });
     }
 
     // Save inspection data into the booking.addons JSON (legacy field) under pickupInspection
     const addons = booking.addons || {};
-    addons.pickupInspection = { photos, fuelLevel, odometer, notes, at: new Date() };
+    addons.pickupInspection = { photos, fuelLevel, odometer, notes, userVerified, documentsChecked, signature, damageAcknowledged, at: new Date() };
 
     const updated = await prisma.booking.update({ where: { id }, data: { addons, status: 'active' } });
 
-    await logEvent('booking', id, 'picked_up', { userId: req.user.id, photosCount: photos.length, fuelLevel, odometer });
+    // Update vehicle status to rented
+    if (booking.vehicleId) {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'rented' }
+      });
+    }
+
+    await logEvent('booking', id, 'picked_up', { userId: req.user.id, photosCount: photos.length, fuelLevel, odometer, userVerified, documentsChecked });
 
     res.json({ success: true, message: 'Pickup recorded, booking is now active', data: { booking: updated } });
   } catch (error) {
@@ -767,7 +821,314 @@ const pickupChecklist = async (req, res) => {
 const returnChecklist = async (req, res) => {
   try {
     const { id } = req.params;
-    const { photos = [], fuelLevel = null, odometer = null, damage = false, damageNotes = '' } = req.body;
+    const { photos = [], fuelLevel = null, odometer = null, damage = false, damageNotes = '', damageCost = 0 } = req.body;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true, pickupLocation: true }
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (booking.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Booking is not active' });
+    }
+
+    const now = new Date();
+    const endDate = new Date(booking.endDate);
+    const startDate = new Date(booking.startDate);
+    const rentalDays = Math.max(1, Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)));
+
+    // Calculate late fee
+    let lateFee = 0;
+    if (now > endDate) {
+      const lateHours = Math.ceil((now - endDate) / (1000 * 60 * 60));
+      const lateFeePerHour = booking.pickupLocation?.lateFeePerHour || 10; // default $10/hour
+      lateFee = lateHours * lateFeePerHour;
+    }
+
+    // Calculate extra mileage
+    let extraMileageCost = 0;
+    const pickupOdometer = booking.addons?.pickupInspection?.odometer;
+    if (pickupOdometer && odometer) {
+      const expectedMiles = rentalDays * 100; // assume 100 miles/day
+      const actualMiles = odometer - pickupOdometer;
+      const extraMiles = Math.max(0, actualMiles - expectedMiles);
+      const mileageRate = booking.pickupLocation?.extraMileageRate || 0.5; // $0.50/mile
+      extraMileageCost = extraMiles * mileageRate;
+    }
+
+    // Calculate fuel top-up
+    let fuelCost = 0;
+    if (fuelLevel !== null && fuelLevel < 1.0) {
+      const fuelNeeded = 1.0 - fuelLevel;
+      const fuelPricePerGallon = booking.pickupLocation?.fuelPricePerGallon || 4.0; // $4/gallon
+      fuelCost = fuelNeeded * fuelPricePerGallon;
+    }
+
+    // Damage cost
+    const damageCostValue = damage ? parseFloat(damageCost) || 0 : 0;
+
+    // Total adjustments
+    const totalAdjustments = lateFee + extraMileageCost + fuelCost + damageCostValue;
+    const finalTotal = booking.totalPrice + totalAdjustments;
+
+    const addons = booking.addons || {};
+    addons.returnInspection = {
+      photos,
+      fuelLevel,
+      odometer,
+      damage,
+      damageNotes,
+      damageCost: damageCostValue,
+      calculations: {
+        lateFee,
+        extraMileageCost,
+        fuelCost,
+        totalAdjustments,
+        finalTotal
+      },
+      at: now
+    };
+
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: {
+        addons,
+        status: 'completed',
+        totalPrice: finalTotal
+      }
+    });
+
+    // Update vehicle status
+    let newVehicleStatus = 'available';
+    if (damage) {
+      newVehicleStatus = 'maintenance';
+    }
+
+    if (booking.vehicleId) {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: newVehicleStatus }
+      });
+    }
+
+    await logEvent('booking', id, 'returned', {
+      userId: req.user.id,
+      damage,
+      odometer,
+      totalAdjustments,
+      finalTotal,
+      vehicleStatus: newVehicleStatus
+    });
+
+    // Award loyalty points for completed booking
+    try {
+      const loyaltyResult = await LoyaltyService.awardPoints(
+        booking.userId,
+        finalTotal,
+        'booking_completed'
+      );
+      console.log('Loyalty points awarded:', loyaltyResult);
+    } catch (loyaltyError) {
+      console.warn('Failed to award loyalty points:', loyaltyError);
+      // Non-critical error, continue
+    }
+
+    // Send receipt
+    try {
+      await notificationService.sendReturnReceipt(booking.user.email, updated, {
+        lateFee,
+        extraMileageCost,
+        fuelCost,
+        damageCost: damageCostValue,
+        totalAdjustments
+      });
+    } catch (e) {
+      console.warn('Failed to send return receipt', e);
+    }
+
+    // Send follow-up for review
+    try {
+      await notificationService.sendReviewRequest(booking.user.email, booking);
+    } catch (e) {
+      console.warn('Failed to send review request', e);
+    }
+
+    res.json({
+      success: true,
+      message: 'Return recorded, booking completed',
+      data: {
+        booking: updated,
+        adjustments: {
+          lateFee,
+          extraMileageCost,
+          fuelCost,
+          damageCost: damageCostValue,
+          totalAdjustments,
+          finalTotal
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Return checklist error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Prepare booking for pickup (Admin only)
+ * POST /api/bookings/:id/prepare
+ */
+const prepareBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { cleaned = false, fueled = false, inspected = false, maintenanceDone = false, conditionImages = [], notes = '' } = req.body;
+
+    const booking = await prisma.booking.findUnique({ where: { id } });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.status !== 'confirmed' && booking.status !== 'reserved') {
+      return res.status(400).json({ success: false, message: 'Booking is not in a state that can be prepared' });
+    }
+
+    const addons = booking.addons || {};
+    addons.preparation = { cleaned, fueled, inspected, maintenanceDone, conditionImages, notes, at: new Date() };
+
+    const updatedBooking = await prisma.booking.update({
+      where: { id },
+      data: {
+        addons,
+        status: 'ready_for_pickup'
+      }
+    });
+
+    // Update vehicle status if all preparation is done
+    if (booking.vehicleId && cleaned && fueled && inspected) {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'available' } // Ready for pickup, but vehicle is still reserved for this booking
+      });
+    }
+
+    await logEvent('booking', id, 'prepared', { userId: req.user.id, preparation: { cleaned, fueled, inspected, maintenanceDone } });
+
+    // Send notification to user that vehicle is ready for pickup
+    try {
+      const user = await prisma.user.findUnique({ where: { id: booking.userId } });
+      if (user) {
+        await notificationService.sendBookingReminder(user.email, booking);
+        // Also send check-in reminder
+        await notificationService.sendCheckinReminder(user.email, booking);
+      }
+    } catch (e) {
+      console.warn('Failed to send pickup ready notification', e);
+    }
+
+    res.json({ success: true, message: 'Booking prepared for pickup', data: { booking: updatedBooking } });
+  } catch (error) {
+    console.error('Prepare booking error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Extend booking (During Rental Period)
+ * POST /api/bookings/:id/extend
+ */
+const extendBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newEndDate, additionalDays } = req.body;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true }
+    });
+
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (booking.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Booking is not active' });
+    }
+
+    const currentEnd = new Date(booking.endDate);
+    let newEnd;
+
+    if (newEndDate) {
+      newEnd = new Date(newEndDate);
+    } else if (additionalDays) {
+      newEnd = new Date(currentEnd.getTime() + additionalDays * 24 * 60 * 60 * 1000);
+    } else {
+      return res.status(400).json({ success: false, message: 'newEndDate or additionalDays required' });
+    }
+
+    if (newEnd <= currentEnd) {
+      return res.status(400).json({ success: false, message: 'New end date must be after current end date' });
+    }
+
+    // Check availability for extension
+    const conflictingBookings = await prisma.booking.findMany({
+      where: {
+        vehicleId: booking.vehicleId,
+        status: { in: ['confirmed', 'active', 'ready_for_pickup'] },
+        OR: [
+          {
+            startDate: { lte: newEnd },
+            endDate: { gte: currentEnd }
+          }
+        ]
+      }
+    });
+
+    if (conflictingBookings.length > 1) { // >1 because current booking is included
+      return res.status(409).json({ success: false, message: 'Vehicle not available for extension' });
+    }
+
+    // Calculate additional price
+    const additionalDaysCount = Math.ceil((newEnd - currentEnd) / (1000 * 60 * 60 * 24));
+    const additionalPrice = booking.vehicle.dailyRate * additionalDaysCount;
+
+    // Update booking
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: {
+        endDate: newEnd,
+        totalPrice: booking.totalPrice + additionalPrice
+      }
+    });
+
+    await logEvent('booking', id, 'extended', { userId: req.user.id, oldEndDate: booking.endDate, newEndDate: newEnd, additionalPrice });
+
+    // Send notification
+    try {
+      await notificationService.sendBookingConfirmation(booking.user.email, updated);
+    } catch (e) {
+      console.warn('Failed to send extension confirmation', e);
+    }
+
+    res.json({ success: true, message: 'Booking extended successfully', data: { booking: updated, additionalPrice } });
+  } catch (error) {
+    console.error('Extend booking error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Update booking location (for tracking during rental)
+ * POST /api/bookings/:id/location
+ */
+const updateBookingLocation = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { latitude, longitude, timestamp, speed, fuelLevel } = req.body;
 
     const booking = await prisma.booking.findUnique({ where: { id } });
     if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
@@ -781,16 +1142,535 @@ const returnChecklist = async (req, res) => {
     }
 
     const addons = booking.addons || {};
-    addons.returnInspection = { photos, fuelLevel, odometer, damage, damageNotes, at: new Date() };
+    if (!addons.locationUpdates) addons.locationUpdates = [];
+    addons.locationUpdates.push({
+      latitude: parseFloat(latitude),
+      longitude: parseFloat(longitude),
+      timestamp: timestamp ? new Date(timestamp) : new Date(),
+      speed: speed ? parseFloat(speed) : null,
+      fuelLevel: fuelLevel ? parseFloat(fuelLevel) : null
+    });
 
-    // If damage or fuel shortfall detected you might create an adjustments workflow; for now just store inspection and mark completed
-    const updated = await prisma.booking.update({ where: { id }, data: { addons, status: 'completed' } });
+    const updated = await prisma.booking.update({ where: { id }, data: { addons } });
 
-    await logEvent('booking', id, 'returned', { userId: req.user.id, damage, odometer });
+    // Check for alerts
+    let alerts = [];
+    if (fuelLevel && fuelLevel < 0.1) alerts.push('Low fuel');
+    if (speed && speed > 120) alerts.push('Speeding'); // assuming km/h
 
-    res.json({ success: true, message: 'Return recorded, booking completed', data: { booking: updated } });
+    // Check approaching drop-off
+    const now = new Date();
+    const endDate = new Date(booking.endDate);
+    const hoursToEnd = (endDate - now) / (1000 * 60 * 60);
+    if (hoursToEnd <= 1 && hoursToEnd > 0) {
+      alerts.push('Approaching drop-off time');
+    }
+
+    // Basic geofencing: assume no cross-border, but for demo, if latitude > 50 or < 25, alert (US approx)
+    if (latitude && (latitude > 50 || latitude < 25)) {
+      alerts.push('Outside allowed area');
+    }
+
+    // Calculate rental stats
+    const startDate = new Date(booking.startDate);
+    const elapsedHours = (now - startDate) / (1000 * 60 * 60);
+    const remainingHours = Math.max(0, (endDate - now) / (1000 * 60 * 60));
+    const estimatedRemainingCost = (remainingHours / 24) * booking.vehicle.dailyRate;
+
+    const stats = {
+      elapsedHours: Math.round(elapsedHours * 100) / 100,
+      remainingHours: Math.round(remainingHours * 100) / 100,
+      estimatedRemainingCost: Math.round(estimatedRemainingCost * 100) / 100,
+      currentMileage: odometer || booking.addons?.pickupInspection?.odometer || 0
+    };
+
+    // Fuel stop suggestions if low fuel
+    let fuelStopSuggestions = [];
+    if (fuelLevel && fuelLevel < 0.2) {
+      // Simulate nearby fuel stops
+      fuelStopSuggestions = [
+        { name: 'Shell Station', distance: '2 miles', address: '123 Main St' },
+        { name: 'BP Gas', distance: '3.5 miles', address: '456 Oak Ave' }
+      ];
+    }
+
+    if (alerts.length > 0) {
+      // Send notification
+      try {
+        await notificationService.sendBookingAlert(booking.user.email, booking, alerts);
+      } catch (e) {
+        console.warn('Failed to send alert', e);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Location updated',
+      data: {
+        alerts,
+        stats,
+        fuelStopSuggestions
+      }
+    });
   } catch (error) {
-    console.error('Return checklist error:', error);
+    console.error('Update location error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Get admin metrics (Post-Rental Analytics)
+ * GET /api/bookings/admin/metrics
+ */
+const getAdminMetrics = async (req, res) => {
+  try {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    // Total revenue last 30 days
+    const revenueResult = await prisma.booking.aggregate({
+      where: {
+        status: 'completed',
+        updatedAt: { gte: thirtyDaysAgo }
+      },
+      _sum: { totalPrice: true }
+    });
+    const totalRevenue = revenueResult._sum.totalPrice || 0;
+
+    // Vehicle utilization: average booked days / total vehicle days
+    const vehicles = await prisma.vehicle.findMany();
+    let totalBookedDays = 0;
+    let totalVehicleDays = vehicles.length * 30; // 30 days
+
+    for (const vehicle of vehicles) {
+      const bookings = await prisma.booking.findMany({
+        where: {
+          vehicleId: vehicle.id,
+          status: { in: ['active', 'completed'] },
+          startDate: { lte: now },
+          endDate: { gte: thirtyDaysAgo }
+        }
+      });
+      for (const booking of bookings) {
+        const start = new Date(Math.max(booking.startDate, thirtyDaysAgo));
+        const end = new Date(Math.min(booking.endDate, now));
+        const days = Math.max(0, (end - start) / (1000 * 60 * 60 * 24));
+        totalBookedDays += days;
+      }
+    }
+    const utilizationRate = totalVehicleDays > 0 ? (totalBookedDays / totalVehicleDays) * 100 : 0;
+
+    // Upcoming bookings
+    const upcomingBookings = await prisma.booking.count({
+      where: {
+        startDate: { gte: now, lte: thirtyDaysFromNow },
+        status: { in: ['confirmed', 'ready_for_pickup'] }
+      }
+    });
+
+    // Vehicles under maintenance
+    const maintenanceVehicles = await prisma.vehicle.count({
+      where: { status: 'maintenance' }
+    });
+
+    // Recent completed bookings
+    const recentCompleted = await prisma.booking.count({
+      where: {
+        status: 'completed',
+        updatedAt: { gte: thirtyDaysAgo }
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        totalRevenue,
+        utilizationRate: Math.round(utilizationRate * 100) / 100,
+        upcomingBookings,
+        maintenanceVehicles,
+        recentCompletedBookings: recentCompleted,
+        period: 'last 30 days'
+      }
+    });
+  } catch (error) {
+    console.error('Get admin metrics error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Report vehicle breakdown or accident (during rental)
+ * POST /api/bookings/:id/incident
+ */
+const reportIncident = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type, description, location, photos = [], contactInfo, severity = 'minor', replacementNeeded = false } = req.body;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true }
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (booking.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Booking is not active' });
+    }
+
+    const addons = booking.addons || {};
+    if (!addons.incidents) addons.incidents = [];
+    addons.incidents.push({
+      type, // 'breakdown' or 'accident'
+      description,
+      location,
+      photos,
+      contactInfo,
+      severity,
+      replacementNeeded,
+      reportedAt: new Date(),
+      status: 'reported'
+    });
+
+    const updated = await prisma.booking.update({ where: { id }, data: { addons } });
+
+    // Update vehicle status to maintenance if severe
+    if (severity === 'major' || type === 'accident') {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'maintenance' }
+      });
+    }
+
+    await logEvent('booking', id, 'incident_reported', { userId: req.user.id, type, severity });
+
+    // Send notification to admin/support
+    try {
+      // Assume admin email or send to support
+      const adminEmail = process.env.ADMIN_EMAIL || 'admin@carhive.com';
+      await notificationService.sendIncidentReport(adminEmail, booking, { type, description, location, severity });
+    } catch (e) {
+      console.warn('Failed to send incident report', e);
+    }
+
+    // If replacement needed, note it
+    let replacementBooking = null;
+    if (replacementNeeded) {
+      // For now, just flag; in real system, create replacement booking
+      addons.replacementRequested = true;
+      await prisma.booking.update({ where: { id }, data: { addons } });
+    }
+
+    res.json({ success: true, message: 'Incident reported successfully', data: { booking: updated } });
+  } catch (error) {
+    console.error('Report incident error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Online check-in (upload documents, generate agreement)
+ * POST /api/bookings/:id/checkin
+ */
+const onlineCheckin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { documents = [], agreementSigned = false, notes = '' } = req.body;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true, pickupLocation: true, dropoffLocation: true }
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (booking.status !== 'confirmed' && booking.status !== 'ready_for_pickup') {
+      return res.status(400).json({ success: false, message: 'Booking is not eligible for check-in' });
+    }
+
+    const addons = booking.addons || {};
+    addons.checkin = {
+      documents, // array of uploaded document URLs or data
+      agreementSigned,
+      notes,
+      checkedInAt: new Date()
+    };
+
+    // Generate QR code for pickup (simulate)
+    const qrCode = `QR-${booking.id}-${Date.now()}`;
+
+    addons.checkin.qrCode = qrCode;
+
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { addons, status: 'checked_in' }
+    });
+
+    await logEvent('booking', id, 'checked_in', { userId: req.user.id });
+
+    // Send digital agreement
+    try {
+      await notificationService.sendDigitalAgreement(booking.user.email, updated, qrCode);
+    } catch (e) {
+      console.warn('Failed to send digital agreement', e);
+    }
+
+    res.json({ success: true, message: 'Check-in completed successfully', data: { booking: updated, qrCode } });
+  } catch (error) {
+    console.error('Online check-in error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Contactless pickup (QR scan, self-inspection)
+ * POST /api/bookings/:id/contactless-pickup
+ */
+const contactlessPickup = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { qrCode, photos = [], fuelLevel = null, odometer = null, notes = '' } = req.body;
+
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true }
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    if (booking.userId !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    // Verify QR code
+    const expectedQr = booking.addons?.checkin?.qrCode;
+    if (!expectedQr || qrCode !== expectedQr) {
+      return res.status(400).json({ success: false, message: 'Invalid QR code' });
+    }
+
+    if (booking.status !== 'checked_in' && booking.status !== 'ready_for_pickup') {
+      return res.status(400).json({ success: false, message: 'Booking not ready for pickup' });
+    }
+
+    // Simulate IoT unlock
+    const unlockSuccess = true; // In real system, call IoT API
+
+    if (!unlockSuccess) {
+      return res.status(500).json({ success: false, message: 'Failed to unlock vehicle' });
+    }
+
+    // Store self-inspection data
+    const addons = booking.addons || {};
+    addons.contactlessPickup = {
+      photos,
+      fuelLevel,
+      odometer,
+      notes,
+      unlockedAt: new Date(),
+      selfInspected: true
+    };
+
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { addons, status: 'active' }
+    });
+
+    // Update vehicle status to rented
+    if (booking.vehicleId) {
+      await prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'rented' }
+      });
+    }
+
+    await logEvent('booking', id, 'contactless_picked_up', { userId: req.user.id, photosCount: photos.length });
+
+    res.json({
+      success: true,
+      message: 'Contactless pickup completed, vehicle unlocked',
+      data: {
+        booking: updated,
+        vehicleUnlocked: true,
+        fuelLevel,
+        odometer
+      }
+    });
+  } catch (error) {
+    console.error('Contactless pickup error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Modify Booking
+ * PUT /api/bookings/:id/modify
+ */
+const modifyBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { startDate, endDate, locationPickupId, locationDropoffId } = req.body;
+
+    // Find booking
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: { vehicle: true, user: true }
+    });
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+
+    // Check permissions
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    // Check if booking can be modified
+    const modifiableStatuses = ['pending', 'confirmed', 'pending_hold'];
+    if (!modifiableStatuses.includes(booking.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Booking cannot be modified at this stage'
+      });
+    }
+
+    // Validate dates if provided
+    let updateData = {};
+    if (startDate || endDate) {
+      const newStartDate = startDate ? new Date(startDate) : booking.startDate;
+      const newEndDate = endDate ? new Date(endDate) : booking.endDate;
+
+      if (newStartDate >= newEndDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'End date must be after start date'
+        });
+      }
+
+      if (newStartDate < new Date()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Start date cannot be in the past'
+        });
+      }
+
+      updateData.startDate = newStartDate;
+      updateData.endDate = newEndDate;
+
+      // Recalculate pricing
+      const days = Math.ceil((newEndDate - newStartDate) / (1000 * 60 * 60 * 24));
+      const dailyRate = booking.vehicle.dailyRate;
+      const subtotal = days * dailyRate;
+      const taxes = subtotal * 0.09; // 9% tax
+      const fees = 5.00; // Base fee
+      const totalPrice = subtotal + taxes + fees;
+
+      updateData.subtotal = subtotal;
+      updateData.taxes = taxes;
+      updateData.fees = fees;
+      updateData.totalPrice = totalPrice;
+    }
+
+    // Validate locations if provided
+    if (locationPickupId) {
+      const pickupLocation = await prisma.location.findUnique({
+        where: { id: locationPickupId }
+      });
+      if (!pickupLocation) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid pickup location'
+        });
+      }
+      updateData.locationPickupId = locationPickupId;
+    }
+
+    if (locationDropoffId) {
+      const dropoffLocation = await prisma.location.findUnique({
+        where: { id: locationDropoffId }
+      });
+      if (!dropoffLocation) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid dropoff location'
+        });
+      }
+      updateData.locationDropoffId = locationDropoffId;
+    }
+
+    // Update booking
+    const updatedBooking = await prisma.booking.update({
+      where: { id },
+      data: updateData,
+      include: {
+        vehicle: true,
+        pickupLocation: true,
+        dropoffLocation: true
+      }
+    });
+
+    // Log the modification
+    await logEvent('booking', id, 'modified', {
+      userId: req.user.id,
+      changes: updateData
+    });
+
+    res.json({
+      success: true,
+      message: 'Booking modified successfully',
+      data: updatedBooking
+    });
+
+  } catch (error) {
+    console.error('Modify booking error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Roadside Assistance / SOS
+ * POST /api/bookings/:id/sos
+ */
+const requestSOS = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { note = '', location = null } = req.body;
+    const booking = await prisma.booking.findUnique({ where: { id }, include: { user: true, vehicle: true } });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+    if (booking.userId !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ success: false, message: 'Access denied' });
+    if (booking.status !== 'active') return res.status(400).json({ success: false, message: 'SOS only available during active rental' });
+    const addons = booking.addons || {};
+    if (!addons.sosRequests) addons.sosRequests = [];
+    addons.sosRequests.push({ at: new Date(), note, location, status: 'dispatched' });
+    await prisma.booking.update({ where: { id }, data: { addons } });
+
+    // Send multi-channel notification
+    try {
+      const adminEmail = process.env.ADMIN_EMAIL || 'support@carhive.com';
+      const adminPhone = process.env.ADMIN_PHONE; // E.164 format: +15555555555
+
+      // Email notification
+      if (notificationService.sendSOSAlert) {
+        await notificationService.sendSOSAlert(adminEmail, booking, { note, location });
+      }
+
+      // SMS notification via integration service
+      if (adminPhone) {
+        const IntegrationService = require('../services/integrationService');
+        await IntegrationService.sendSOSAlertSMS(adminPhone, booking, location);
+      }
+    } catch (e) { console.warn('SOS notify failed', e); }
+
+    await logEvent('booking', id, 'sos_requested', { userId: req.user.id, note });
+    res.json({ success: true, message: 'SOS request received. Assistance dispatched.' });
+  } catch (error) {
+    console.error('SOS request error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
@@ -806,6 +1686,15 @@ module.exports = {
   getAllBookings,
   holdBooking,
   confirmBooking,
+  modifyBooking,
   pickupChecklist,
   returnChecklist,
+  prepareBooking,
+  extendBooking,
+  updateBookingLocation,
+  getAdminMetrics,
+  reportIncident,
+  onlineCheckin,
+  contactlessPickup,
+  requestSOS,
 };
