@@ -35,14 +35,17 @@ const loginSchema = Joi.object({
 
 // Vehicle creation validation
 const vehicleSchema = Joi.object({
+  sku: Joi.string().optional(),
   make: Joi.string().min(1).max(50).required(),
   model: Joi.string().min(1).max(50).required(),
   year: Joi.number().integer().min(1900).max(new Date().getFullYear() + 1).required(),
-  type: Joi.string().valid('economy', 'compact', 'midsize', 'fullsize', 'suv', 'luxury', 'convertible', 'truck', 'van').required(),
+  category: Joi.string().valid('economy', 'compact', 'midsize', 'suv', 'luxury', 'van').required(),
   transmission: Joi.string().valid('manual', 'automatic').required(),
   fuelType: Joi.string().valid('gasoline', 'diesel', 'hybrid', 'electric').required(),
+  baseDailyRate: Joi.number().positive().required(),
   dailyRate: Joi.number().positive().required(),
-  locationId: Joi.string().required(),
+  status: Joi.string().valid('available', 'reserved', 'rented', 'maintenance', 'retired').default('available'),
+  locationId: Joi.string().optional(),
   imageUrl: Joi.string().uri().optional(),
   description: Joi.string().max(500).optional(),
   seats: Joi.number().integer().min(1).max(15).default(5),
