@@ -12,6 +12,10 @@ const locationRoutes = require('./routes/locations');
 const reviewRoutes = require('./routes/reviews');
 const userRoutes = require('./routes/users');
 const paymentsRoutes = require('./routes/payments');
+const maintenanceRoutes = require('./routes/maintenance');
+const loyaltyRoutes = require('./routes/loyalty');
+const adminRoutes = require('./routes/admin');
+const trackingRoutes = require('./routes/tracking');
 
 // Import middleware
 const errorHandler = require('./middlewares/errorHandler');
@@ -77,6 +81,10 @@ app.use('/api/locations', locationRoutes);
 app.use('/api/reviews', reviewRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/payments', paymentsRoutes);
+app.use('/api/maintenance', maintenanceRoutes);
+app.use('/api/loyalty', loyaltyRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/tracking', trackingRoutes);
 
 // 404 handler for undefined routes
 app.use('*', (req, res) => {
