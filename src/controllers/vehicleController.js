@@ -31,18 +31,21 @@ const getVehicles = async (req, res) => {
     const take = parseInt(limit);
 
     // Build filter conditions
-    const where = {
-      status: 'available'
-    };
+    const where = {};
+
+    // Only filter by status if not admin
+    if (!req.user || req.user.role !== 'admin') {
+      where.status = 'available';
+    }
 
     if (location) {
-      where.location = {
-        OR: [
-          { code: { contains: location, mode: 'insensitive' } },
-          { name: { contains: location, mode: 'insensitive' } },
-          { city: { contains: location, mode: 'insensitive' } }
-        ]
-      };
+      // Search vehicles by related location fields using OR across relation filters
+      // Prisma expects relation filters like { location: { field: { contains: ... } } }
+      where.OR = (where.OR || []).concat([
+        { location: { code: { contains: location, mode: 'insensitive' } } },
+        { location: { name: { contains: location, mode: 'insensitive' } } },
+        { location: { city: { contains: location, mode: 'insensitive' } } }
+      ]);
     }
 
     if (type) {
@@ -424,7 +427,9 @@ module.exports = {
   getVehicleById,
   createVehicle,
   updateVehicle,
-  deleteVehicle
+  deleteVehicle,
+  bulkImportVehicles,
+  updateVehicleStatus
 };
 
 /**
@@ -461,6 +466,77 @@ async function getAvailableVehicles(req, res) {
     res.json({ success: true, data: { results: estimates } });
   } catch (error) {
     console.error('Get available vehicles error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+}
+
+/**
+ * Bulk import vehicles from a CSV-like payload
+ * POST /api/vehicles/bulk-import
+ * Body: { vehicles: [{ make, model, year, category, transmission, fuelType, dailyRate, locationId, imageUrl }] }
+ */
+async function bulkImportVehicles(req, res) {
+  try {
+    const { vehicles } = req.body;
+    if (!Array.isArray(vehicles) || vehicles.length === 0) {
+      return res.status(400).json({ success: false, message: 'vehicles array required' });
+    }
+
+    const created = [];
+    const errors = [];
+    for (const v of vehicles) {
+      try {
+        // Minimal validation; reuse schema if present
+        const data = {
+          make: v.make,
+          model: v.model,
+          year: parseInt(v.year) || new Date().getFullYear(),
+          category: v.category || 'standard',
+          transmission: v.transmission || 'automatic',
+          fuelType: v.fuelType || 'gasoline',
+          baseDailyRate: v.baseDailyRate ? parseFloat(v.baseDailyRate) : (v.dailyRate ? parseFloat(v.dailyRate) : 50),
+          dailyRate: v.dailyRate ? parseFloat(v.dailyRate) : (v.baseDailyRate ? parseFloat(v.baseDailyRate) : 50),
+          status: v.status || 'available',
+          locationId: v.locationId || null,
+          imageUrl: v.imageUrl || null,
+          description: v.description || null,
+          seats: v.seats ? parseInt(v.seats) : 5,
+          doors: v.doors ? parseInt(v.doors) : 4,
+          features: Array.isArray(v.features) ? v.features : [],
+        };
+        const vehicle = await prisma.vehicle.create({ data });
+        created.push(vehicle);
+      } catch (e) {
+        errors.push({ item: v, error: e.message });
+      }
+    }
+
+    res.status(201).json({ success: true, message: 'Bulk import processed', data: { createdCount: created.length, errorCount: errors.length, created, errors } });
+  } catch (error) {
+    console.error('Bulk import vehicles error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+}
+
+/**
+ * Update just the status of a vehicle (quick status transitions)
+ * PATCH /api/vehicles/:id/status { status }
+ */
+async function updateVehicleStatus(req, res) {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const valid = ['available','reserved','rented','maintenance','retired'];
+    if (!valid.includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+    const existing = await prisma.vehicle.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ success: false, message: 'Vehicle not found' });
+
+    const updated = await prisma.vehicle.update({ where: { id }, data: { status } });
+    res.json({ success: true, message: 'Vehicle status updated', data: { vehicle: updated } });
+  } catch (error) {
+    console.error('Update vehicle status error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 }
