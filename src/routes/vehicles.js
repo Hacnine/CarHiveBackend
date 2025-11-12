@@ -5,7 +5,9 @@ const {
   getVehicleById,
   createVehicle,
   updateVehicle,
-  deleteVehicle
+  deleteVehicle,
+  bulkImportVehicles,
+  updateVehicleStatus
 } = require('../controllers/vehicleController');
 const { authenticate, authorize, optionalAuth } = require('../middlewares/auth');
 
@@ -21,5 +23,7 @@ router.get('/:id', getVehicleById);
 router.post('/', authenticate, authorize('admin'), createVehicle);
 router.put('/:id', authenticate, authorize('admin'), updateVehicle);
 router.delete('/:id', authenticate, authorize('admin'), deleteVehicle);
+router.post('/bulk-import', authenticate, authorize('admin'), bulkImportVehicles);
+router.patch('/:id/status', authenticate, authorize('admin'), updateVehicleStatus);
 
 module.exports = router;
