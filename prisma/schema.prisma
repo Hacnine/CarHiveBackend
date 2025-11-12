@@ -20,6 +20,8 @@ model User {
   passwordHash String
   phone        String?
   role         UserRole  @default(customer)
+  loyaltyPoints Int      @default(0)
+  loyaltyTier  String    @default("bronze")
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
@@ -32,15 +34,15 @@ model User {
 
 model Vehicle {
   id           String        @id @default(auto()) @map("_id") @db.ObjectId
-  sku          String?       @unique
-  make         String
-  model        String
+  sku          String?
+  make         String       @default("")
+  model        String       @default("")
   year         Int
-  category     String
-  transmission Transmission
-  fuelType     FuelType
-  baseDailyRate Float
-  dailyRate    Float
+  category     String        @default("standard")
+  transmission Transmission @default(automatic)
+  fuelType     FuelType     @default(gasoline)
+  baseDailyRate Float       @default(0.0)
+  dailyRate    Float       @default(0.0)
   status       VehicleStatus @default(available)
   locationId   String?       @db.ObjectId
   imageUrl     String?
@@ -56,6 +58,7 @@ model Vehicle {
   location Location? @relation(fields: [locationId], references: [id])
   bookings Booking[]
   reviews  Review[]
+  maintenanceTasks MaintenanceTask[]
 
   @@map("vehicles")
 }
@@ -184,6 +187,27 @@ model AuditLog {
   createdAt DateTime @default(now())
 }
 
+model MaintenanceTask {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  vehicleId   String   @db.ObjectId
+  type        String   // "cleaning", "service", "inspection", "repair"
+  description String
+  status      String   @default("scheduled") // "scheduled", "in_progress", "completed", "cancelled"
+  scheduledAt DateTime
+  completedAt DateTime?
+  assignedTo  String?
+  notes       String?
+  photos      String[] @default([])
+  cost        Float?
+  mileage     Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id])
+
+  @@map("maintenance_tasks")
+}
+
 // Enums
 enum UserRole {
   customer
@@ -204,6 +228,7 @@ enum FuelType {
 
 enum VehicleStatus {
   available
+  reserved
   rented
   maintenance
   retired
@@ -218,6 +243,8 @@ enum BookingStatus {
   pending
   pending_hold
   confirmed
+  reserved
+  ready_for_pickup
   active
   completed
   cancelled
