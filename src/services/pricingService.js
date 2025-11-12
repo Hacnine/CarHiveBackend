@@ -130,11 +130,12 @@ function calculatePriceBreakdown({ vehicle, startDate, endDate, addons = [], loc
 /**
  * Convenience function that fetches necessary DB records and returns breakdown.
  */
-async function calculatePriceForBooking({ vehicleId, startDate, endDate, addons = [], promoCode = null, userId = null }) {
+async function calculatePriceForBooking({ vehicleId, startDate, endDate, addons = [], promoCode = null, userId = null, pickupLocationId = null, dropoffLocationId = null }) {
   const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
   if (!vehicle) throw new Error('Vehicle not found');
 
-  const location = vehicle.locationId ? await prisma.location.findUnique({ where: { id: vehicle.locationId } }) : {};
+  const pickupLocation = pickupLocationId ? await prisma.location.findUnique({ where: { id: pickupLocationId } }) : (vehicle.locationId ? await prisma.location.findUnique({ where: { id: vehicle.locationId } }) : {});
+  const dropoffLocation = dropoffLocationId ? await prisma.location.findUnique({ where: { id: dropoffLocationId } }) : pickupLocation;
 
   // load price rules overlapping period and vehicle category
   const rules = await prisma.priceRule.findMany({
@@ -161,7 +162,16 @@ async function calculatePriceForBooking({ vehicleId, startDate, endDate, addons 
 
   const user = userId ? await prisma.user.findUnique({ where: { id: userId } }) : {};
 
-  return calculatePriceBreakdown({ vehicle, startDate, endDate, addons: resolvedAddons, location, priceRules: rules, promoRule, user });
+  // Calculate cross-location fee
+  const crossLocationFee = (pickupLocationId && dropoffLocationId && pickupLocationId !== dropoffLocationId) ? 50 : 0; // Fixed fee for different locations
+
+  const breakdown = calculatePriceBreakdown({ vehicle, startDate, endDate, addons: resolvedAddons, location: pickupLocation, priceRules: rules, promoRule, user });
+
+  // Add cross-location fee to fees
+  breakdown.fees += crossLocationFee;
+  breakdown.total += crossLocationFee;
+
+  return breakdown;
 }
 
 module.exports = {
